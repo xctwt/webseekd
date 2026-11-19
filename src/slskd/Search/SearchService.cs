@@ -317,7 +317,8 @@ namespace slskd.Search
 
                 // initialize the list of responses that we'll use to accumulate them
                 // populated by the responseHandler we pass to SearchAsync
-                List<SearchResponse> responses = new();
+                // responses arrive concurrently from many connections, so this must be thread safe
+                ConcurrentQueue<SearchResponse> responses = new();
 
                 options ??= new SearchOptions();
                 options = options.WithActions(
@@ -354,7 +355,7 @@ namespace slskd.Search
                 // the client state (e.g. disconnected) or a problem with the search (e.g. no terms)
                 var soulseekSearchTask = Client.SearchAsync(
                     query,
-                    responseHandler: (response) => responses.Add(response),
+                    responseHandler: (response) => responses.Enqueue(response),
                     scope,
                     token,
                     options,
@@ -423,7 +424,7 @@ namespace slskd.Search
                         rateLimiter.Dispose();
                         CancellationTokens.TryRemove(id, out _);
                     }
-                }, cancellationToken: cancellationTokenSource.Token);
+                });
 
                 // broadcast and return the _newly created_ search; it will continue to be updated in the background
                 await SearchHub.BroadcastUpdateAsync(search);
@@ -461,7 +462,7 @@ namespace slskd.Search
         {
             if (CancellationTokens.TryGetValue(id, out var cts))
             {
-                cts.Cancel();
+                cts.Cancel(swallowObjectDisposedException: true);
                 return true;
             }
 
