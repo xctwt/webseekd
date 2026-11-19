@@ -1,10 +1,9 @@
 import { apiBaseUrl } from '../config';
 import { clearToken, getToken, isPassthroughEnabled } from './token';
-import axios from 'axios';
+import { create } from 'axios';
 
-axios.defaults.baseURL = apiBaseUrl;
-
-const api = axios.create({
+const api = create({
+  baseURL: apiBaseUrl,
   withCredentials: true,
 });
 

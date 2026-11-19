@@ -443,8 +443,12 @@ namespace slskd
         public static string GetErrorAndOrExceptionMessage(this ModelError error)
         {
             var ex = error?.Exception?.Message;
-            return string.IsNullOrEmpty(error?.ErrorMessage) ? ex :
-                string.IsNullOrEmpty(ex) ? error?.ErrorMessage : $"{error?.ErrorMessage} ({ex})";
+            if (string.IsNullOrEmpty(error?.ErrorMessage))
+            {
+                return ex;
+            }
+
+            return string.IsNullOrEmpty(ex) ? error?.ErrorMessage : $"{error?.ErrorMessage} ({ex})";
         }
 
         /// <summary>

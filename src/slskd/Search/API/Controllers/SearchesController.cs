@@ -55,7 +55,9 @@ namespace slskd.Search.API
     [ApiVersion("0")]
     [Produces("application/json")]
     [Consumes("application/json")]
+#pragma warning disable AV0014 // [ApiController] was removed on purpose, to opt out of its automatic behaviors
     public class SearchesController : ControllerBase
+#pragma warning restore AV0014
     {
         /// <summary>
         ///     Initializes a new instance of the <see cref="SearchesController"/> class.
