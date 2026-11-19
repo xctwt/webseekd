@@ -52,8 +52,8 @@ public class KnownUnsupportedTypeConverter : JsonConverter<object>
             || typeof(Module).IsAssignableFrom(typeToConvert)
             || typeof(Delegate).IsAssignableFrom(typeToConvert) // covers Action, Func, EventHandler, MulticastDelegate
             || typeof(SerializationInfo).IsAssignableFrom(typeToConvert)
-            || typeToConvert == typeof(IntPtr)
-            || typeToConvert == typeof(UIntPtr);
+            || typeToConvert == typeof(nint)
+            || typeToConvert == typeof(nuint);
     }
 
     public override object Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)

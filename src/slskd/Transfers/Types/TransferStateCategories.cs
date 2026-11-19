@@ -52,7 +52,7 @@ public static class TransferStateCategories
     ///     </list>
     /// </summary>
     public static readonly HashSet<TransferStates> Successful = [
-        TransferStates.Completed | TransferStates.Succeeded // 16 | 32 = 48
+        TransferStates.Completed | TransferStates.Succeeded, // 16 | 32 = 48
     ];
 
     /// <summary>
@@ -98,7 +98,7 @@ public static class TransferStateCategories
     public static readonly HashSet<TransferStates> Completed = [
         TransferStates.Completed, // 16, in case of some sort of a malfunction or regression
         .. Successful,
-        .. Failed
+        .. Failed,
     ];
 
     /// <summary>

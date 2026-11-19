@@ -1028,6 +1028,7 @@ namespace slskd
                 {
                     options.ReportApiVersions = true;
                 })
+                .AddMvc()
                 .AddApiExplorer(options =>
                 {
                     options.GroupNameFormat = "'v'VVV";
@@ -1223,7 +1224,7 @@ namespace slskd
             if (OptionsAtStartup.Feature.Swagger)
             {
                 app.UseSwagger();
-                app.UseSwaggerUI(options => app.Services.GetRequiredService<IApiVersionDescriptionProvider>().ApiVersionDescriptions.ToList()
+                app.UseSwaggerUI(options => app.DescribeApiVersions().ToList()
                     .ForEach(description => options.SwaggerEndpoint($"{(urlBase == "/" ? string.Empty : urlBase)}/swagger/{description.GroupName}/swagger.json", description.GroupName)));
 
                 Log.Information("Publishing Swagger documentation to {URL}", "/swagger");

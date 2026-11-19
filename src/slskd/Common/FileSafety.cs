@@ -148,8 +148,7 @@ public static class FileSafety
             }
         }
 
-        segments = [.. segments
-            .Where(s => !string.IsNullOrEmpty(s))];
+        segments = [.. segments.Where(s => !string.IsNullOrEmpty(s))];
 
         var combined = string.Join(sep, [root, .. segments]);
 

@@ -61,10 +61,7 @@ namespace slskd.Search
         public string ResponsesJson
         {
             get => JsonSerializer.Serialize(Responses);
-            set
-            {
-                Responses = JsonSerializer.Deserialize<IEnumerable<Response>>(value);
-            }
+            set => Responses = JsonSerializer.Deserialize<IEnumerable<Response>>(value);
         }
 
         public string SearchText { get; init; }
