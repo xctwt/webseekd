@@ -55,11 +55,12 @@ namespace slskd
     using Asp.Versioning.ApiExplorer;
     using Microsoft.AspNetCore.Authentication.JwtBearer;
     using Microsoft.AspNetCore.Builder;
-    using Microsoft.AspNetCore.DataProtection;
+    using Microsoft.AspNetCore.DataProtection.KeyManagement;
     using Microsoft.AspNetCore.Diagnostics;
     using Microsoft.AspNetCore.Hosting;
     using Microsoft.AspNetCore.Http;
     using Microsoft.AspNetCore.Server.Kestrel.Core;
+    using Microsoft.Data.Sqlite;
     using Microsoft.EntityFrameworkCore;
     using Microsoft.Extensions.Configuration;
     using Microsoft.Extensions.DependencyInjection;
@@ -299,6 +300,7 @@ namespace slskd
         private static Mutex Mutex { get; set; }
         private static IDisposable DotNetRuntimeStats { get; set; }
         private static VolatileOverlayConfigurationSource<OptionsOverlay> VolatileOverlayConfigurationSource { get; set; } = new VolatileOverlayConfigurationSource<OptionsOverlay>();
+        private static List<SqliteConnection> VolatileDatabaseKeepaliveConnections { get; } = [];
 
         [Argument('g', "generate-cert", "generate X509 certificate and password for HTTPs")]
         private static bool GenerateCertificate { get; set; }
@@ -403,7 +405,11 @@ namespace slskd
             // only one long-running instance.
             try
             {
-                Mutex = new Mutex(initiallyOwned: true, Compute.Sha256Hash(AppName), out bool created);
+                Mutex = new Mutex(
+                    initiallyOwned: true,
+                    name: Compute.Sha256Hash(AppName),
+                    options: new NamedWaitHandleOptions { CurrentUserOnly = false, CurrentSessionOnly = true },
+                    out bool created);
 
                 if (!created)
                 {
@@ -472,7 +478,17 @@ namespace slskd
 
                 if (OptionsAtStartup.Debug)
                 {
-                    Log.Information($"Configuration:\n{Configuration.GetDebugView()}");
+                    // redact values for any key matching the name of a property marked [Secret]. keys from YAML may be
+                    // snake or kebab case, so normalize before comparing. this over-redacts, which is fine here
+                    var secretNames = typeof(Options).Assembly.GetTypes()
+                        .Where(t => t == typeof(Options) || (t.FullName?.StartsWith($"{typeof(Options).FullName}+") ?? false))
+                        .SelectMany(t => t.GetProperties())
+                        .Where(p => p.GetCustomAttributes(typeof(SecretAttribute), inherit: false).Length > 0)
+                        .Select(p => p.Name.ToLowerInvariant())
+                        .ToHashSet();
+
+                    Log.Information($"Configuration:\n{Configuration.GetDebugView(context =>
+                        secretNames.Contains(context.Key.Replace("_", string.Empty).Replace("-", string.Empty).ToLowerInvariant()) ? "*****" : context.Value)}");
                 }
 
                 if (!OptionsAtStartup.TryValidate(out var result))
@@ -483,7 +499,7 @@ namespace slskd
             }
             catch (Exception ex)
             {
-                Log.Information($"Invalid configuration: {(!OptionsAtStartup.Debug ? ex : ex.Message)}");
+                Log.Information($"Invalid configuration: {(OptionsAtStartup.Debug ? ex : ex.Message)}");
                 return;
             }
 
@@ -543,7 +559,7 @@ namespace slskd
 
             if (!string.IsNullOrEmpty(OptionsAtStartup.Logger.Loki))
             {
-                Log.Information("Forwarding logs to Grafana Loki instance at {LoggerLokiUrl}", OptionsAtStartup.Logger.Loki);
+                Log.Information("Forwarding logs to Grafana Loki");
             }
 
             // bootstrap the ASP.NET application
@@ -755,7 +771,7 @@ namespace slskd
                     var pooling = OptionsAtStartup.Flags.NoSqlitePooling ? "False" : "True"; // don't invert and ToString this it is confusing
 
                     var connStr = OptionsAtStartup.Flags.Volatile
-                        ? $"Data Source=file:{database}?mode=memory;Pooling={pooling};"
+                        ? $"Data Source=file:{database}?mode=memory&cache=shared;Pooling={pooling};"
                         : $"Data Source={Path.Combine(DataDirectory, $"{database}.db")};Pooling={pooling}";
 
                     return new KeyValuePair<Database, ConnectionString>(database, connStr);
@@ -864,8 +880,15 @@ namespace slskd
 
             services.ConfigureTelemetry();
 
-            services.AddDataProtection()
-                .PersistKeysToFileSystem(new DirectoryInfo(Path.Combine(DataDirectory, "misc", ".DataProtection-Keys")));
+            /*
+                by default, adding authentication of any kind adds data protection, and the default configuration for
+                data protection drops .DataProtection-Keys on the filesystem. we're not using data protection, but this
+                can't be suppressed.
+
+                instead, we must fake the key manager into using a dummy repository to stop it from using the filesystem
+            */
+            services.AddDataProtection();
+            services.Configure<KeyManagementOptions>(options => options.XmlRepository = new DataProtectionKeyRepository());
 
             var jwtSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(OptionsAtStartup.Web.Authentication.Jwt.Key));
 
@@ -1187,12 +1210,14 @@ namespace slskd
                         if (!options.Authentication.Disabled)
                         {
                             var auth = context.Request.Headers["Authorization"].FirstOrDefault();
-                            var providedCreds = auth?.Split(' ').Last();
+                            var providedCreds = auth?.Split(' ').Last() ?? string.Empty;
                             var validCreds = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{options.Authentication.Username}:{options.Authentication.Password}"));
 
+                            // use paranoid FixedTimeEquals to protect against time attacks
                             if (string.IsNullOrEmpty(auth) ||
-                                !auth.StartsWith("Basic", StringComparison.InvariantCultureIgnoreCase) ||
-                                !string.Equals(providedCreds, validCreds, StringComparison.InvariantCultureIgnoreCase))
+                                !auth.StartsWith("Basic ", StringComparison.InvariantCultureIgnoreCase) ||
+                                string.IsNullOrEmpty(providedCreds) ||
+                                !System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(providedCreds), Encoding.UTF8.GetBytes(validCreds)))
                             {
                                 context.Response.StatusCode = (int)HttpStatusCode.Unauthorized;
                                 return;
@@ -1280,7 +1305,7 @@ namespace slskd
                         e => !OptionsAtStartup.Logger.NoDisk,
                         config => config.File(
                             Path.Combine(LogDirectory, $"{AppName}-.log"),
-                            outputTemplate: (OptionsAtStartup.Debug ? "[{SourceContext}] " : string.Empty) + "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}",
+                            outputTemplate: (OptionsAtStartup.Debug ? "[{SourceContext}] " : string.Empty) + "[{Timestamp:yyyy-MM-ddTHH:mm:ss.fff} {Level:u3}] {Message:lj}{NewLine}{Exception}",
                             rollingInterval: RollingInterval.Day,
                             retainedFileTimeLimit: TimeSpan.FromDays(OptionsAtStartup.Retention.Logs))))
                 .WriteTo.Conditional(
@@ -1308,7 +1333,7 @@ namespace slskd
                         var record = new LogRecord()
                         {
                             Timestamp = logEvent.Timestamp.LocalDateTime,
-                            Context = logEvent.Properties["SourceContext"].ToString().TrimStart('"').TrimEnd('"'),
+                            Context = logEvent.Properties.TryGetValue("SourceContext", out var sourceContext) ? sourceContext.ToString().TrimStart('"').TrimEnd('"') : null,
                             SubContext = logEvent.Properties.ContainsKey("SubContext") ? logEvent.Properties["SubContext"].ToString().TrimStart('"').TrimEnd('"') : null,
                             Level = logEvent.Level.ToString(),
                             Message = message.TrimStart('"').TrimEnd('"'),
@@ -1340,11 +1365,11 @@ namespace slskd
 
                 if (e.IsTerminating)
                 {
-                    Serilog.Log.Logger.Fatal(exception, "Unhandled fatal exception: {Message}", e.IsTerminating);
+                    Serilog.Log.Logger.Fatal(exception, "Unhandled fatal exception: {Message}", exception?.Message);
                 }
                 else
                 {
-                    Serilog.Log.Logger.Error(exception, "Unhandled exception: {Message}", exception.Message);
+                    Serilog.Log.Logger.Error(exception, "Unhandled exception: {Message}", exception?.Message);
                 }
             };
         }
@@ -1532,6 +1557,17 @@ namespace slskd
                             .LogTo(OptionsAtStartup.Debug ? Log.Debug : Log.Information, LogLevel.Information);
                     }
                 });
+
+                // in-memory databases are destroyed when the last connection to them closes. hold one open for the
+                // lifetime of the application so the data (and schema) survive between operations. this must be
+                // opened before EnsureCreated(), otherwise the schema is created in a database that is destroyed
+                // as soon as EnsureCreated() closes its connection
+                if (OptionsAtStartup.Flags.Volatile)
+                {
+                    var keepalive = new SqliteConnection(connectionString);
+                    keepalive.Open();
+                    VolatileDatabaseKeepaliveConnections.Add(keepalive);
+                }
 
                 /*
                     instantiate the DbContext and make sure it is created

@@ -198,7 +198,8 @@ namespace slskd.Transfers.Downloads
             FileService fileService,
             IRelayService relayService,
             IFTPService ftpClient,
-            EventBus eventBus)
+            EventBus eventBus,
+            TimeProvider timeProvider = null)
         {
             Batches = batchService;
             Searches = searchService;
@@ -209,6 +210,8 @@ namespace slskd.Transfers.Downloads
             FTP = ftpClient;
             Relay = relayService;
             EventBus = eventBus;
+
+            TimeProvider = timeProvider ?? TimeProvider.System;
 
             Clock.EveryMinute += (_, _) => Task.Run(() => CleanupEnqueueSemaphoresAsync());
             Clock.EveryFiveSeconds += (_, _) => Task.Run(() => EmitMetrics());
@@ -248,6 +251,7 @@ namespace slskd.Transfers.Downloads
         private IOptionsMonitor<Options> OptionsMonitor { get; }
         private EventBus EventBus { get; }
         private Regex SubdirectoryPatternTokenRegex { get; } = new Regex(@"\$\{([^\{\}]*)\}", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private TimeProvider TimeProvider { get; }
 
         /// <summary>
         ///     Allow only one enqueue operation for a given user at a time. Entries are added on the fly if they
@@ -323,7 +327,7 @@ namespace slskd.Transfers.Downloads
                 throw new ArgumentException("One or more files contains a dangerous path traversal segment", nameof(files));
             }
 
-            if (fileList.Count != fileList.Distinct().Count())
+            if (fileList.Count != fileList.Select(f => f.Filename).Distinct().Count())
             {
                 throw new ArgumentException("Two or more files in request are duplicated", nameof(files));
             }
@@ -517,11 +521,12 @@ namespace slskd.Transfers.Downloads
                             2. the transfer enters a state containing Completed
                             3. the linked CancellationTokenSource we add to CancellationTokens is cancelled
                             4. the 'max wait time' CancellationTokenSource is cancelled
+                            5. the DownloadAsync() method throws
 
                             add this to the dictionary before inserting the record, so we are guaranteed to have it
                             in the right place once the transfer hits the UI
                         */
-                        var enqueuedTcs = new TaskCompletionSource<Transfer>();
+                        var enqueuedTcs = new TaskCompletionSource<Transfer>(TaskCreationOptions.RunContinuationsAsynchronously);
 
                         // satisfies condition #3; CancellationTokenSource set cancelled by the user (via API call)
                         var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -557,17 +562,16 @@ namespace slskd.Transfers.Downloads
                                 TransferStates state = TransferStates.None;
 
                                 // satisfies condition #4; remote user doesn't respond after a really long time
-                                using var timeoutCts = new CancellationTokenSource(maxTimeToWaitForEnqueueRequestAck);
+                                using var timeoutCts = new CancellationTokenSource(delay: maxTimeToWaitForEnqueueRequestAck, timeProvider: TimeProvider);
                                 timeoutCts.Token.Register(() =>
                                 {
+                                    // note: disposed once we leave the try block, so registration doesn't fire unless it actually times out
                                     Log.Warning("Download of {Filename} from {Username} failed to enqueue remotely after hard time limit of {Duration} seconds. State transition history: {History}", transfer.Filename, username, maxTimeToWaitForEnqueueRequestAck.TotalSeconds, string.Join(", ", transitions));
                                     enqueuedTcs.TrySetException(new TimeoutException($"Download failed to enqueue remotely after hard time limit of {maxTimeToWaitForEnqueueRequestAck.TotalSeconds} secs"));
 
-                                    // cancel the download attempt so that it doesn't keep running and cause the internal
+                                    // cancel the download attempt so that it doesn't keep running (within Soulseek.NET) and cause the internal
                                     // state of slskd to diverge from the internal state of Soulseek.NET.
-                                    // the transfer record is recorded as being cancelled when this happens and there's not
-                                    // an easy/good way to stop it.
-                                    cts.Cancel();
+                                    cts.Cancel(swallowObjectDisposedException: true);
                                 });
 
                                 // satisfies conditions #1 and #2
@@ -611,6 +615,10 @@ namespace slskd.Transfers.Downloads
 
                                     Log.Error(ex, "Task for download of {Filename} from {Username} did not complete successfully: {Error}", file.Filename, username, ex.Message);
 
+                                    // trip the TCS if DownloadAsync() throws before any of the other conditions trip it
+                                    // this is harmless if it has already been tripped
+                                    enqueuedTcs.TrySetException(ex);
+
                                     if (!TryFail(transferId, exception: ex))
                                     {
                                         Log.Error(ex, "Failed to clean up transfer {Id} after failed download", transferId);
@@ -628,6 +636,7 @@ namespace slskd.Transfers.Downloads
                                     2. the transfer enters a state containing Completed
                                     3. the linked CancellationTokenSource we add to CancellationTokens is cancelled
                                     4. the 'max wait time' CancellationTokenSource is cancelled
+                                    5. the DownloadAsync() method throws
                                 */
                                 await enqueuedTcs.Task;
 
@@ -734,9 +743,9 @@ namespace slskd.Transfers.Downloads
 
                 var transfer = context.Transfers.Find(id);
 
-                if (transfer == default)
+                if (transfer == default || transfer.Direction != TransferDirection.Download)
                 {
-                    throw new NotFoundException($"No download matching id ${id}");
+                    throw new NotFoundException($"No download matching id {id}");
                 }
 
                 var place = await Client.GetDownloadPlaceInQueueAsync(transfer.Username, transfer.Filename);
@@ -1020,7 +1029,7 @@ namespace slskd.Transfers.Downloads
             // of the transfer to Cancelled.  _should_!
             if (CancellationTokens.TryRemove(id, out var cts))
             {
-                cts.Cancel();
+                cts.Cancel(swallowObjectDisposedException: true);
                 return true;
             }
 
@@ -1071,6 +1080,12 @@ namespace slskd.Transfers.Downloads
 
             t.EndedAt ??= DateTime.UtcNow;
 
+            // Retry.Do() wraps failures in an AggregateException; use the most recent so that the state reflects what happened
+            if (exception is AggregateException aggregate && aggregate.InnerExceptions.Count > 0)
+            {
+                exception = aggregate.InnerExceptions.Last();
+            }
+
             // Soulseek.NET will include the filename and username in some messages; this is useful for many things but not tracking
             // exceptions in a database. when we encounter one of these, drop the first segment.
             var m = exception.Message;
@@ -1082,6 +1097,7 @@ namespace slskd.Transfers.Downloads
                 {
                     OperationCanceledException => TransferStates.Cancelled,
                     TimeoutException => TransferStates.TimedOut,
+                    TransferRejectedException => TransferStates.Rejected,
                     _ => TransferStates.Errored,
                 };
             }
@@ -1095,6 +1111,11 @@ namespace slskd.Transfers.Downloads
             {
                 Log.Error(ex, "Failed to update database: {Message}", ex.Message);
                 return false;
+            }
+            finally
+            {
+                CancellationTokens.TryRemove(id, out var cts);
+                cts?.TryDispose();
             }
         }
 
@@ -1233,20 +1254,6 @@ namespace slskd.Transfers.Downloads
                                 transfer.EnqueuedAt ??= DateTime.UtcNow;
                             }
 
-                            // important! the transfer on the Soulseek.NET side may have completed, but the slskd transfer
-                            // *might* still have remaining retry attempts. leave this non-committal for now, and allow
-                            // the final update after all retry attempts have been exhausted to add it.
-                            // this means that the ONLY way to check whether a transfer is really 'dead' inclusive of all
-                            // retries is to look for this flag
-                            if (args.Transfer.State.HasFlag(TransferStates.Completed)
-                                && !args.Transfer.State.HasFlag(TransferStates.Succeeded)
-                                && transfer.Attempts < retryOptions.Attempts)
-                            {
-                                transfer.State = TransferStates.Queued | TransferStates.Locally;
-                            }
-
-                            transfer = transfer.WithSoulseekTransfer(args.Transfer);
-
                             Telemetry.Metrics.Update(() =>
                             {
                                 if (!TransferStateCategories.Queued.Contains(args.PreviousState) && TransferStateCategories.Queued.Contains(transfer.State))
@@ -1265,6 +1272,18 @@ namespace slskd.Transfers.Downloads
                             });
 
                             stateHistory.Add(transfer.State);
+
+                            // important! the transfer on the Soulseek.NET side may have completed, but the slskd transfer
+                            // *might* still have remaining retry attempts. leave this non-committal for now, and allow
+                            // the final update after all retry attempts have been exhausted to add it.
+                            // this means that the ONLY way to check whether a transfer is really 'dead' inclusive of all
+                            // retries is to look for this flag
+                            if (args.Transfer.State.HasFlag(TransferStates.Completed)
+                                && !args.Transfer.State.HasFlag(TransferStates.Succeeded)
+                                && transfer.Attempts < retryOptions.Attempts)
+                            {
+                                transfer.State = TransferStates.Queued | TransferStates.Locally;
+                            }
 
                             // todo: broadcast
                             SynchronizedUpdate(transfer, semaphore: updateSyncRoot, cancellationToken: cancellationToken);
@@ -1568,11 +1587,10 @@ namespace slskd.Transfers.Downloads
             {
                 Log.Error(ex, "Download of {Filename} from user {Username} failed: {Message}", transfer.Filename, transfer.Username, ex.Message);
 
+                SynchronizedUpdate(transfer, semaphore: updateSyncRoot, cancellationToken: CancellationToken.None);
                 TryFail(transfer.Id, exception: ex);
 
-                // todo: broadcast
-                SynchronizedUpdate(transfer, semaphore: updateSyncRoot, cancellationToken: CancellationToken.None);
-
+                // todo: broadcast transfer state to a hub
                 Telemetry.Metrics.Update(() =>
                 {
                     Telemetry.Metrics.Transfers.Downloads.Completed.Failed.Inc(1);
@@ -1584,11 +1602,10 @@ namespace slskd.Transfers.Downloads
             {
                 Log.Error(ex, "Download of {Filename} from user {Username} failed: {Message}", transfer.Filename, transfer.Username, ex.Message);
 
+                SynchronizedUpdate(transfer, semaphore: updateSyncRoot, cancellationToken: CancellationToken.None);
                 TryFail(transfer.Id, exception: ex);
 
-                // todo: broadcast
-                SynchronizedUpdate(transfer, semaphore: updateSyncRoot, cancellationToken: CancellationToken.None);
-
+                // todo: broadcast transfer state to a hub
                 Telemetry.Metrics.Update(() =>
                 {
                     Telemetry.Metrics.Transfers.Downloads.Completed.Failed.Inc(1);

@@ -35,6 +35,7 @@
 
 namespace slskd.Validation
 {
+    using System;
     using System.ComponentModel.DataAnnotations;
     using System.IO;
 
@@ -56,7 +57,7 @@ namespace slskd.Validation
 
         protected override ValidationResult IsValid(object value, ValidationContext validationContext)
         {
-            if (value != null)
+            if (value is not null && !string.IsNullOrEmpty(value.ToString()))
             {
                 var file = Path.GetFullPath(value?.ToString());
 
@@ -76,7 +77,7 @@ namespace slskd.Validation
                             using var fs = File.Open(file, FileMode.Open, FileAccess.Value, FileShare.ReadWrite | FileShare.Delete);
                             fs.Close();
                         }
-                        catch (IOException)
+                        catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
                         {
                             return new ValidationResult($"The {validationContext.DisplayName} field specifies a file '{file}' that cannot be opened for required access '{FileAccess}'");
                         }

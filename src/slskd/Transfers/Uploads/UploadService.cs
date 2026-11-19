@@ -45,6 +45,7 @@ namespace slskd.Transfers.Uploads
     using System.Threading;
     using System.Threading.Tasks;
     using Microsoft.EntityFrameworkCore;
+    using Microsoft.EntityFrameworkCore.Query;
     using Serilog;
     using slskd.Events;
     using slskd.Relay;
@@ -96,11 +97,11 @@ namespace slskd.Transfers.Uploads
         Task<Transfer> UploadAsync(Transfer transfer, CancellationToken cancellationToken = default);
 
         /// <summary>
-        ///     Finds a single upload matching the specified <paramref name="expression"/>.
+        ///     Finds a single upload matching the specified <paramref name="id"/>.
         /// </summary>
-        /// <param name="expression">The expression to use to match uploads.</param>
+        /// <param name="id">The unique identifier of the upload.</param>
         /// <returns>The found transfer, or default if not found.</returns>
-        Transfer Find(Expression<Func<Transfer, bool>> expression);
+        Transfer Find(Guid id);
 
         /// <summary>
         ///     Gets upload statistics for the specified <paramref name="username"/>.
@@ -111,9 +112,9 @@ namespace slskd.Transfers.Uploads
         UserUploadStatistics GetUserStatistics(string username, DateTime? utcNow = null);
 
         /// <summary>
-        ///     Returns a list of all uploads matching the optional <paramref name="expression"/>.
+        ///     Returns a list of all uploads matching the specified <paramref name="expression"/>.
         /// </summary>
-        /// <param name="expression">An optional expression used to match uploads.</param>
+        /// <param name="expression">An expression used to match uploads.</param>
         /// <param name="includeRemoved">A value indicating whether to include uploads that have been removed previously.</param>
         /// <returns>The list of uploads matching the specified expression, or all uploads if no expression is specified.</returns>
         List<Transfer> List(Expression<Func<Transfer, bool>> expression, bool includeRemoved);
@@ -125,6 +126,15 @@ namespace slskd.Transfers.Uploads
         /// <param name="states">One or more states by which uploads are filtered for pruning.</param>
         /// <returns>The number of pruned uploads.</returns>
         int Prune(int age, params TransferStates[] states);
+
+        /// <summary>
+        ///     Returns a list of all uploads matching the specified <paramref name="query"/>, projected to type <typeparamref name="TResult"/>.
+        /// </summary>
+        /// <typeparam name="TResult">The Type of the returned projection.</typeparam>
+        /// <param name="query">The query expression.</param>
+        /// <param name="includeRemoved">A value indicating whether to include uploads that have been removed previously.</param>
+        /// <returns>The list of uploads matching the specified query.</returns>
+        List<TResult> Query<TResult>(Func<IQueryable<Transfer>, IQueryable<TResult>> query, bool includeRemoved = false);
 
         /// <summary>
         ///     Removes the completed upload matching the specified <paramref name="id"/>.
@@ -297,7 +307,7 @@ namespace slskd.Transfers.Uploads
                     we're not using DbContext and tracked changes here because we don't want to hold a connection
                     open for the duration of the upload
                 */
-                transfer = Find(t => t.Id == transfer.Id)
+                transfer = Find(transfer.Id)
                     ?? throw new TransferNotFoundException($"Transfer with ID {transfer.Id} not found");
 
                 if (transfer.State != (TransferStates.Queued | TransferStates.Locally))
@@ -413,7 +423,6 @@ namespace slskd.Transfers.Uploads
 
                                         lastReportedAverageSpeed = now;
                                     }
-
                                 }
                                 finally
                                 {
@@ -430,14 +439,14 @@ namespace slskd.Transfers.Uploads
                     disposeInputStreamOnCompletion: true, // note: don't set this to false!
                     governor: (tx, req, ct) => Governor.GetBytesAsync(tx.Username, req, ct),
                     reporter: (tx, att, grant, act) => Governor.ReturnBytes(tx.Username, att, grant, act),
-                    slotAwaiter: (tx, ct) => Queue.AwaitStartAsync(tx.Username, tx.Filename),
-                    slotReleased: (tx) => Queue.Complete(tx.Username, tx.Filename));
+                    slotAwaiter: (tx, ct) => Queue.AwaitStartAsync(transfer, ct),
+                    slotReleased: (tx) => Queue.Complete(transfer));
 
                 // register the cancellation token
                 CancellationTokens.TryAdd(transfer.Id, cts);
 
                 // add the transfer to the UploadQueue so that it can become eligible for selection
-                Queue.Enqueue(transfer.Username, transfer.Filename);
+                Queue.Enqueue(transfer);
                 transfer.EnqueuedAt = DateTime.UtcNow;
                 SynchronizedUpdate(transfer, semaphore: syncRoot, cancellationToken: cts.Token);
 
@@ -507,11 +516,10 @@ namespace slskd.Transfers.Uploads
             {
                 Log.Error(ex, "Upload of {Filename} to user {Username} failed: {Message}", transfer.Filename, transfer.Username, ex.Message);
 
+                SynchronizedUpdate(transfer, semaphore: syncRoot, cancellationToken: CancellationToken.None);
                 TryFail(transfer.Id, "File could not be found", TransferStates.Completed | TransferStates.Aborted);
 
-                // todo: broadcast
-                SynchronizedUpdate(transfer, semaphore: syncRoot, cancellationToken: CancellationToken.None);
-
+                // todo: broadcast transfer state to a hub
                 Telemetry.Metrics.Update(() =>
                 {
                     Telemetry.Metrics.Transfers.Uploads.Completed.Failed.Inc(1);
@@ -523,11 +531,10 @@ namespace slskd.Transfers.Uploads
             {
                 Log.Error(ex, "Upload of {Filename} to user {Username} failed: {Message}", transfer.Filename, transfer.Username, ex.Message);
 
+                SynchronizedUpdate(transfer, semaphore: syncRoot, cancellationToken: CancellationToken.None);
                 TryFail(transfer.Id, exception: ex);
 
-                // todo: broadcast
-                SynchronizedUpdate(transfer, semaphore: syncRoot, cancellationToken: CancellationToken.None);
-
+                // todo: broadcast transfer state to a hub
                 Telemetry.Metrics.Update(() =>
                 {
                     Telemetry.Metrics.Transfers.Uploads.Completed.Failed.Inc(1);
@@ -539,11 +546,10 @@ namespace slskd.Transfers.Uploads
             {
                 Log.Error(ex, "Upload of {Filename} to user {Username} failed: {Message}", transfer.Filename, transfer.Username, ex.Message);
 
+                SynchronizedUpdate(transfer, semaphore: syncRoot, cancellationToken: CancellationToken.None);
                 TryFail(transfer.Id, exception: ex);
 
-                // todo: broadcast
-                SynchronizedUpdate(transfer, semaphore: syncRoot, cancellationToken: CancellationToken.None);
-
+                // todo: broadcast transfer state to a hub
                 Telemetry.Metrics.Update(() =>
                 {
                     Telemetry.Metrics.Transfers.Uploads.Completed.Failed.Inc(1);
@@ -599,7 +605,7 @@ namespace slskd.Transfers.Uploads
                     // if for some reason this logic exits without the slotReleased delegate and Complete() being invoked,
                     // the file will get stuck in the queue and prevent any further uploads to the user. be extra cautious
                     // and ensure it gets removed
-                    Queue.TryComplete(username: transfer.Username, filename: transfer.Filename);
+                    Queue.TryComplete(transfer);
                 }
                 catch (Exception ex)
                 {
@@ -796,21 +802,15 @@ namespace slskd.Transfers.Uploads
         }
 
         /// <summary>
-        ///     Finds a single upload matching the specified <paramref name="expression"/>.
+        ///     Finds a single upload matching the specified <paramref name="id"/>.
         /// </summary>
-        /// <param name="expression">The expression to use to match uploads.</param>
+        /// <param name="id">The unique identifier of the upload.</param>
         /// <returns>The found transfer, or default if not found.</returns>
-        public Transfer Find(Expression<Func<Transfer, bool>> expression)
+        public Transfer Find(Guid id)
         {
             try
             {
-                using var context = ContextFactory.CreateDbContext();
-
-                return context.Transfers
-                    .AsNoTracking()
-                    .Where(t => t.Direction == TransferDirection.Upload)
-                    .Where(expression)
-                    .SingleOrDefault();
+                return Query(q => q.Where(t => t.Id == id), includeRemoved: true).SingleOrDefault();
             }
             catch (Exception ex)
             {
@@ -820,9 +820,9 @@ namespace slskd.Transfers.Uploads
         }
 
         /// <summary>
-        ///     Returns a list of all uploads matching the optional <paramref name="expression"/>.
+        ///     Returns a list of all uploads matching the specified <paramref name="expression"/>.
         /// </summary>
-        /// <param name="expression">An optional expression used to match uploads.</param>
+        /// <param name="expression">An expression used to match uploads.</param>
         /// <param name="includeRemoved">A value indicating whether to include uploads that have been removed previously.</param>
         /// <returns>The list of uploads matching the specified expression, or all uploads if no expression is specified.</returns>
         public List<Transfer> List(Expression<Func<Transfer, bool>> expression, bool includeRemoved)
@@ -831,18 +831,51 @@ namespace slskd.Transfers.Uploads
 
             try
             {
-                using var context = ContextFactory.CreateDbContext();
-
-                return context.Transfers
-                    .AsNoTracking()
-                    .Where(t => t.Direction == TransferDirection.Upload)
-                    .Where(t => !t.Removed || includeRemoved)
-                    .Where(expression)
-                    .ToList();
+                return Query(q => q.Where(expression), includeRemoved);
             }
             catch (Exception ex)
             {
                 Log.Error(ex, "Failed to list uploads: {Message}", ex.Message);
+                throw;
+            }
+        }
+
+        /// <summary>
+        ///     Returns a list of all uploads matching the specified <paramref name="query"/>, projected to type <typeparamref name="TResult"/>.
+        /// </summary>
+        /// <typeparam name="TResult">The Type of the returned projection.</typeparam>
+        /// <param name="query">The query expression.</param>
+        /// <param name="includeRemoved">A value indicating whether to include uploads that have been removed previously.</param>
+        /// <returns>The list of uploads matching the specified query.</returns>
+        public List<TResult> Query<TResult>(Func<IQueryable<Transfer>, IQueryable<TResult>> query, bool includeRemoved = false)
+        {
+            ArgumentNullException.ThrowIfNull(query);
+
+            try
+            {
+                using var context = ContextFactory.CreateDbContext();
+
+                var transfers = context.Transfers
+                    .AsNoTracking()
+                    .Where(t => t.Direction == TransferDirection.Upload);
+
+                if (!includeRemoved)
+                {
+                    transfers = transfers.Where(t => !t.Removed);
+                }
+
+                var result = query(transfers);
+
+                if (result.Provider is not IAsyncQueryProvider)
+                {
+                    throw new InvalidOperationException("Query must be fully translatable to SQL; in-memory evaluation is not allowed (remove any AsEnumerable() present in the query)");
+                }
+
+                return result.ToList();
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "Failed to execute upload queury: {Message}", ex.Message);
                 throw;
             }
         }
@@ -937,7 +970,7 @@ namespace slskd.Transfers.Uploads
         {
             if (CancellationTokens.TryRemove(id, out var cts))
             {
-                cts.Cancel();
+                cts.Cancel(swallowObjectDisposedException: true);
                 return true;
             }
 
@@ -1082,7 +1115,7 @@ namespace slskd.Transfers.Uploads
 
         private bool TryFail(Guid id, string exception, TransferStates state)
         {
-            var t = Find(t => t.Id == id);
+            var t = Find(id);
 
             if (t is null)
             {

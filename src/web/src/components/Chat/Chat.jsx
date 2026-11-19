@@ -71,7 +71,13 @@ class Chat extends Component {
           this.props.location?.state?.user ||
           sessionStorage.getItem(activeChatKey) ||
           '',
-        interval: window.setInterval(this.fetchConversations, 5_000),
+        interval: window.setInterval(async () => {
+          try {
+            await this.fetchConversations();
+          } catch (error) {
+            console.error(error);
+          }
+        }, 5_000),
       },
       async () => {
         await this.fetchConversations();
@@ -135,7 +141,6 @@ class Chat extends Component {
     // check to see if the active chat is still active
     // this will happen whenever a chat is closed/removed
     if (activeConversation) {
-      console.log('active?', activeConversation);
       // *before* fetching messages, ack any unacked messages
       // for the active chat
       if (activeConversation.hasUnAcknowledgedMessages === true) {

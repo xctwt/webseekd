@@ -103,7 +103,7 @@ namespace slskd.Integrations.MusicBrainz.API
         /// <response code="200">The release was saved.</response>
         /// <response code="400">The request is invalid.</response>
         [HttpPut("{id:guid}")]
-        [Authorize(Policy = AuthPolicy.Any)]
+        [Authorize(Policy = AuthPolicy.Any, Roles = AuthRole.ReadWriteOrAdministrator)]
         [ProducesResponseType(typeof(SavedRelease), 200)]
         public async Task<IActionResult> Save([FromRoute] Guid id, [FromBody] SavedRelease request)
         {
@@ -124,7 +124,7 @@ namespace slskd.Integrations.MusicBrainz.API
         /// <response code="204">The release was removed.</response>
         /// <response code="404">The release isn't saved.</response>
         [HttpDelete("{id:guid}")]
-        [Authorize(Policy = AuthPolicy.Any)]
+        [Authorize(Policy = AuthPolicy.Any, Roles = AuthRole.ReadWriteOrAdministrator)]
         [ProducesResponseType(204)]
         public async Task<IActionResult> Remove([FromRoute] Guid id, [FromQuery] bool keepSearch = false)
         {
@@ -150,7 +150,7 @@ namespace slskd.Integrations.MusicBrainz.API
         /// <returns></returns>
         /// <response code="200">The releases were removed; the response is the number removed.</response>
         [HttpDelete]
-        [Authorize(Policy = AuthPolicy.Any)]
+        [Authorize(Policy = AuthPolicy.Any, Roles = AuthRole.ReadWriteOrAdministrator)]
         [ProducesResponseType(typeof(int), 200)]
         public async Task<IActionResult> RemoveAll([FromQuery] bool keepSearches = false)
         {

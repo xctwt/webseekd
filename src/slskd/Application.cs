@@ -133,19 +133,19 @@ namespace slskd
             Console.CancelKeyPress += (_, args) =>
             {
                 ShuttingDown = true;
-                Program.MasterCancellationTokenSource.Cancel();
+                Program.MasterCancellationTokenSource.Cancel(swallowObjectDisposedException: true);
                 Log.Warning("Received SIGINT");
             };
 
             foreach (var signal in new[] { PosixSignal.SIGINT, PosixSignal.SIGQUIT, PosixSignal.SIGTERM })
             {
-                PosixSignalRegistration.Create(signal, context =>
+                PosixSignals.Add(PosixSignalRegistration.Create(signal, context =>
                 {
                     ShuttingDown = true;
-                    Program.MasterCancellationTokenSource.Cancel();
+                    Program.MasterCancellationTokenSource.Cancel(swallowObjectDisposedException: true);
                     Log.Fatal("Received {Signal}", signal);
                     Environment.Exit(1);
-                });
+                }));
             }
 
             OptionsAtStartup = optionsAtStartup;
@@ -245,6 +245,7 @@ namespace slskd
         public static bool IsShuttingDown => Environment.HasShutdownStarted || ShuttingDown;
 
         private static bool ShuttingDown { get; set; } = false;
+        private static List<PosixSignalRegistration> PosixSignals { get; } = [];
 
         private ISoulseekClient Client { get; set; }
         private FileService Files { get; }
@@ -427,7 +428,15 @@ namespace slskd
             // os-specific keepalive is configured for long-lived connections for the server and distributed parent/children
             var serverOptions = connectionOptions.With(
                 inactivityTimeout: -1, // don't disconnect due to inactivity
-                configureSocket: socket => ConfigureSocketKeepaliveOptions(socket, OptionsAtStartup.Soulseek.Connection));
+                configureSocket: socket =>
+                {
+                    ConfigureSocketKeepaliveOptions(socket, OptionsAtStartup.Soulseek.Connection);
+
+                    if (OptionsAtStartup.Soulseek.Connection.Mtu.HasValue)
+                    {
+                        ConfigureSocketMtu(socket, OptionsAtStartup.Soulseek.Connection.Mtu.Value);
+                    }
+                });
 
             var distributedOptions = connectionOptions.With(
                 writeQueueSize: OptionsAtStartup.Soulseek.Connection.Buffer.WriteQueue, // write queue set to keep distributed children from impacting performance
@@ -577,6 +586,35 @@ namespace slskd
             }
         }
 
+        private void ConfigureSocketMtu(Socket socket, int mtu)
+        {
+            /*
+                limits the size of the packets sent and received on this connection to the given MTU. there's no per-socket MTU setting,
+                so this is done by setting TCP_MAXSEG to the MTU minus the IPv4 and TCP headers (20 bytes each)
+
+                Windows is skipped because it only supports reading TCP_MAXSEG, not setting it
+                see: https://learn.microsoft.com/en-us/windows/win32/winsock/ipproto-tcp-socket-options
+                and: https://learn.microsoft.com/en-us/windows/win32/api/winsock/nf-winsock-getsockopt
+            */
+            if (!(System.OperatingSystem.IsLinux() || System.OperatingSystem.IsMacOS() || System.OperatingSystem.IsFreeBSD()))
+            {
+                return;
+            }
+
+            try
+            {
+                const int IPPROTO_TCP = 6;
+                const int TCP_MAXSEG = 2;
+                const int IPV4_AND_TCP_HEADER_SIZE = 40;
+
+                socket.SetRawSocketOption(IPPROTO_TCP, TCP_MAXSEG, BitConverter.GetBytes(mtu - IPV4_AND_TCP_HEADER_SIZE));
+            }
+            catch (SocketException ex)
+            {
+                Log.Warning("Failed to set the MTU of the server connection to {MTU}: {Message}", mtu, ex.Message);
+            }
+        }
+
         private async Task EnqueueDownload(string username, IPEndPoint endpoint, string filename)
         {
             Metrics.Enqueue.RequestsReceived.Inc(1);
@@ -713,7 +751,7 @@ namespace slskd
                 }
 
                 bool IsNull(Options.TransfersOptions.LimitsOptions.Limits lim, Options.TransfersOptions.LimitsOptions.Limits global)
-                    => (lim is null && global is null) || ((lim?.Files ?? global?.Files ?? lim?.Megabytes ?? global?.Megabytes ?? lim.Failures ?? global.Failures) is null);
+                    => (lim is null && global is null) || ((lim?.Files ?? global?.Files ?? lim?.Megabytes ?? global?.Megabytes ?? lim?.Failures ?? global?.Failures) is null);
 
                 /*
                  * we have limits set, so now we have to fetch the data and compare to see if any would be hit if we allow this transfer to be enqueued.
@@ -1411,16 +1449,30 @@ namespace slskd
         {
             if (Users.IsBlacklisted(username, endpoint.Address))
             {
-                Log.Information("Returned empty directory listing for blacklisted user {Username} ({IP})", username, endpoint.Address);
+                Log.Information("Returned no place in queue for blacklisted user {Username} ({IP})", username, endpoint.Address);
                 return Task.FromResult<int?>(null);
             }
 
             try
             {
-                var place = Transfers.Uploads.Queue.EstimatePosition(username, filename);
+                var upload = Transfers.Uploads.Query(q =>
+                    q
+                        .Where(t => t.Username == username && t.Filename == filename && t.EnqueuedAt != null)
+                        .OrderByDescending(t => t.EnqueuedAt)
+                        .Take(1),
+                    includeRemoved: false)
+                    .FirstOrDefault();
+
+                // transfer might not be in the queue, or might not exist at all
+                if (upload is null)
+                {
+                    return Task.FromResult<int?>(null);
+                }
+
+                var place = Transfers.Uploads.Queue.EstimatePosition(upload);
                 return Task.FromResult((int?)place);
             }
-            catch (NotFoundException)
+            catch (NotFoundException) // transfer is not in the queue
             {
                 return Task.FromResult<int?>(null);
             }
@@ -1523,8 +1575,15 @@ namespace slskd
                 if (PreviousOptions.Filters.Search.Request.Except(newOptions.Filters.Search.Request).Any()
                     || newOptions.Filters.Search.Request.Except(PreviousOptions.Filters.Search.Request).Any())
                 {
+                    var regexOptions = RegexOptions.Compiled;
+
+                    if (!Flags.CaseSensitiveRegEx)
+                    {
+                        regexOptions |= RegexOptions.IgnoreCase;
+                    }
+
                     CompiledSearchRequestFilters = newOptions.Filters.Search.Request
-                        .Select(f => new Regex(f, RegexOptions.Compiled))
+                        .Select(f => new Regex(f, regexOptions))
                         .ToList()
                         .AsReadOnly();
 
@@ -1587,7 +1646,15 @@ namespace slskd
 
                         serverPatch = connectionPatch.With(
                             inactivityTimeout: -1, // don't disconnect due to inactivity
-                            configureSocket: socket => ConfigureSocketKeepaliveOptions(socket, options: connection));
+                            configureSocket: socket =>
+                            {
+                                ConfigureSocketKeepaliveOptions(socket, options: connection);
+
+                                if (connection.Mtu.HasValue)
+                                {
+                                    ConfigureSocketMtu(socket, connection.Mtu.Value);
+                                }
+                            });
 
                         distributedPatch = connectionPatch.With(
                             writeQueueSize: connection.Buffer.WriteQueue, // write queue set to keep distributed children from impacting performance
@@ -1768,7 +1835,7 @@ namespace slskd
                         // note: the following uses cached user data to determine group, so if the user's data
                         // isn't cached they may get a forecast based on the wrong group.  this is a hot path though,
                         // and we don't want to incur the massive penalties that would caching data for each request.
-                        var forecastedPosition = Transfers.Uploads.Queue.ForecastPosition(username);
+                        var (groupName, totalSlots, freeSlots, forecastedPosition) = Transfers.Uploads.Queue.ForecastPosition(username);
 
                         Log.Debug("Sending search response with {Count} files to {Username} for query '{Query}'", results.Count(), username, query.SearchText);
 
@@ -1776,7 +1843,7 @@ namespace slskd
                             Client.Username,
                             token,
                             uploadSpeed: State.CurrentValue.User.Statistics.AverageSpeed,
-                            hasFreeUploadSlot: forecastedPosition == 0,
+                            hasFreeUploadSlot: freeSlots > 0,
                             queueLength: forecastedPosition,
                             fileList: results);
                     }
@@ -1976,12 +2043,11 @@ namespace slskd
                 // we are deliberately skipping it here; if the username is watched
                 // leech detection works and they get accurate info, if not, they won't
                 var groupName = await Users.GetOrFetchGroupAsync(username);
-                var group = Transfers.Uploads.Queue.GetGroupInfo(groupName);
 
                 // forecast the position at which this user would enter the queue if they were to request
                 // a file at this moment. this will be zero if a slot is available and the transfer would
                 // begin immediately
-                var forecastedPosition = Transfers.Uploads.Queue.ForecastPosition(username);
+                var (group, totalSlots, freeSlots, forecastedPosition) = Transfers.Uploads.Queue.ForecastPosition(username);
 
                 // if i get a user's info to determine whether i want to download files from them,
                 // i want to know how many slots they have, which gives me an idea of how fast their
@@ -1990,9 +2056,9 @@ namespace slskd
                 // revisited 3 years later: why was it important to leave this comment??
                 var info = new UserInfo(
                     description: Options.Soulseek.Description,
-                    uploadSlots: group.Slots,
+                    uploadSlots: totalSlots,
                     queueLength: forecastedPosition,
-                    hasFreeUploadSlot: forecastedPosition == 0,
+                    hasFreeUploadSlot: freeSlots > 0,
                     picture: pictureBytes);
 
                 return info;
